@@ -1,0 +1,200 @@
+---
+# Enable Intel IOMMU (VT-d) for PCI passthrough on a Proxmox VE host.
+#
+# Usage:
+#   ansible-playbook -i 'pve-host,' -u root proxmox_iommu.yml
+#   ansible-playbook -i inventory.ini proxmox_iommu.yml -e reboot_after=true
+#   ansible-playbook -i inventory.ini proxmox_iommu.yml --check --diff
+#
+# Inventory group used by default: "proxmox". For an ad-hoc host list as above,
+# override with:  -e target_hosts=all
+#
+# Backups: every file this playbook edits is copied to
+#   <file>.bak.<timestamp>
+# before any change is made, and the paths are printed.
+#
+# NOTE: VT-d must also be enabled in the BIOS. This playbook cannot do that.
+
+- name: Enable Intel IOMMU for PCI passthrough on Proxmox VE
+  hosts: "{{ target_hosts | default('proxmox') }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    iommu_flags:
+      - intel_iommu=on
+      - iommu=pt
+    vfio_modules:
+      - vfio
+      - vfio_iommu_type1
+      - vfio_pci
+    bootloader: auto        # auto | grub | systemd-boot
+    reboot_after: false
+    grub_file: /etc/default/grub
+    cmdline_file: /etc/kernel/cmdline
+    modules_file: /etc/modules
+
+  tasks:
+    # ---------------------------------------------------------------- checks
+    - name: Make sure this is an Intel CPU
+      ansible.builtin.assert:
+        that: "'GenuineIntel' in ansible_processor"
+        fail_msg: "Non-Intel CPU detected; this playbook sets intel_iommu=on."
+
+    - name: Remind about BIOS requirement
+      ansible.builtin.debug:
+        msg: "Reminder: VT-d must be enabled in the BIOS or the kernel flag will have no effect."
+
+    # ----------------------------------------------------- detect bootloader
+    - name: Query proxmox-boot-tool
+      ansible.builtin.command: proxmox-boot-tool status
+      register: pbt
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Decide which bootloader to configure
+      ansible.builtin.set_fact:
+        boot_mode: >-
+          {{ bootloader if bootloader != 'auto'
+             else ('systemd-boot'
+                   if (pbt.rc == 0 and (pbt.stdout | default('')) is regex('configured with: (uefi|systemd-boot)'))
+                   else 'grub') }}
+
+    - name: Build list of files that will be edited and a single backup timestamp
+      ansible.builtin.set_fact:
+        backup_suffix: "bak.{{ ansible_date_time.iso8601_basic_short }}"
+        edit_files: "{{ [modules_file, (grub_file if boot_mode == 'grub' else cmdline_file)] }}"
+
+    - name: Show detected bootloader
+      ansible.builtin.debug:
+        msg: "Bootloader: {{ boot_mode }}; files to edit: {{ edit_files | join(', ') }}"
+
+    # --------------------------------------------------------------- backups
+    - name: Confirm files to edit exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ edit_files }}"
+      register: file_stats
+
+    - name: Fail if a file to edit is missing
+      ansible.builtin.assert:
+        that: item.stat.exists
+        fail_msg: "{{ item.item }} does not exist; check the bootloader detection (-e bootloader=grub|systemd-boot)."
+      loop: "{{ file_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Back up every file before editing
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ item }}.{{ backup_suffix }}"
+        remote_src: true
+        mode: preserve
+      loop: "{{ edit_files }}"
+      register: backups
+
+    - name: Print backup locations
+      ansible.builtin.debug:
+        msg: "Backed up {{ item.item }} -> {{ item.dest }}"
+      loop: "{{ backups.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ------------------------------------------------------------ GRUB edits
+    - name: Add IOMMU flags to GRUB_CMDLINE_LINUX_DEFAULT
+      ansible.builtin.replace:
+        path: "{{ grub_file }}"
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT="(?![^"]*\b{{ item }}\b)[^"]*?)[ \t]*"'
+        replace: '\1 {{ item }}"'
+      loop: "{{ iommu_flags }}"
+      when: boot_mode == 'grub'
+      notify: Update grub
+
+    # ------------------------------------------------- systemd-boot edits
+    - name: Add IOMMU flags to /etc/kernel/cmdline
+      ansible.builtin.replace:
+        path: "{{ cmdline_file }}"
+        regexp: '^(?!.*\b{{ item }}\b)(\S.*?)[ \t]*$'
+        replace: '\1 {{ item }}'
+      loop: "{{ iommu_flags }}"
+      when: boot_mode == 'systemd-boot'
+      notify: Refresh proxmox-boot-tool
+
+    # --------------------------------------------------------- module edits
+    - name: Ensure VFIO modules load at boot
+      ansible.builtin.lineinfile:
+        path: "{{ modules_file }}"
+        line: "{{ item }}"
+        regexp: '^{{ item }}\s*$'
+        state: present
+      loop: "{{ vfio_modules }}"
+      notify: Update initramfs
+
+    # Apply bootloader / initramfs changes now so the printout below is final.
+    - name: Run pending handlers
+      ansible.builtin.meta: flush_handlers
+
+    # ------------------------------------------------------ verify + print
+    - name: Verify the flags are present in the edited bootloader file
+      ansible.builtin.command: "grep -E '(intel_iommu=on)' {{ grub_file if boot_mode == 'grub' else cmdline_file }}"
+      register: flag_check
+      changed_when: false
+      failed_when: flag_check.rc != 0
+      when: not ansible_check_mode
+
+    - name: Read back every edited file
+      ansible.builtin.command: "cat {{ item }}"
+      loop: "{{ edit_files }}"
+      register: printed
+      changed_when: false
+      check_mode: false
+
+    - name: Print contents of every edited file
+      ansible.builtin.debug:
+        msg: "{{ ['===== ' ~ item.item ~ ' ====='] + item.stdout_lines }}"
+      loop: "{{ printed.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ---------------------------------------------------------------- reboot
+    - name: Reboot to activate IOMMU
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when: reboot_after | bool and not ansible_check_mode
+
+    - name: Check live kernel state after reboot
+      ansible.builtin.shell: |
+        echo "--- /proc/cmdline ---"
+        cat /proc/cmdline
+        echo "--- dmesg (DMAR/IOMMU) ---"
+        dmesg | grep -e DMAR -e IOMMU || echo "NO IOMMU MESSAGES FOUND"
+        echo "--- IOMMU group count ---"
+        ls /sys/kernel/iommu_groups 2>/dev/null | wc -l
+      register: live_state
+      changed_when: false
+      failed_when: false
+      when: reboot_after | bool and not ansible_check_mode
+
+    - name: Print live IOMMU state
+      ansible.builtin.debug:
+        var: live_state.stdout_lines
+      when: reboot_after | bool and not ansible_check_mode
+
+    - name: Reboot reminder
+      ansible.builtin.debug:
+        msg: >-
+          Reboot required. Afterwards verify with:
+          cat /proc/cmdline; dmesg | grep -e DMAR -e IOMMU
+      when: not (reboot_after | bool)
+
+  # ------------------------------------------------------------- handlers
+  handlers:
+    - name: Update grub
+      ansible.builtin.command: update-grub
+
+    - name: Refresh proxmox-boot-tool
+      ansible.builtin.command: proxmox-boot-tool refresh
+
+    - name: Update initramfs
+      ansible.builtin.command: update-initramfs -u -k all
